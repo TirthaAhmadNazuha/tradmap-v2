@@ -19,13 +19,14 @@ class TradmapCrawler {
   }
   async start() {
     this.browser = await launch({
-      headless: false,
       userDataDir: 'data_browser',
       args: [
         '--no-sandbox'
       ]
     });
     this.page = (await this.browser.pages())[0];
+    const ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
+    await this.page.setUserAgent(ua)
     const client = await this.page.createCDPSession();
 
     await client.send('Page.setDownloadBehavior', {
@@ -49,47 +50,52 @@ class TradmapCrawler {
 
   async init() {
     await this.open('https://www.trademap.org/Index.aspx')
-    if (this.page.url().includes('Cookie')) {
+    try {
+      if (this.page.url().includes('Cookie')) {
+        await Promise.all([
+          this.page.click('#ctl00_MenuControl_CheckBox_DoNotShowAgain'),
+          this.waitN(),
+          this.page.click('#ctl00_MenuControl_div_Button_ClosePopupNews > input'),
+        ])
+      }
+      let box = await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product')
       await Promise.all([
-        this.page.click('#ctl00_MenuControl_CheckBox_DoNotShowAgain'),
         this.waitN(),
-        this.page.click('#ctl00_MenuControl_div_Button_ClosePopupNews > input'),
+        box.click(),
       ])
+      await this.sleep(2000)
+      box = await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product')
+      await box.click()
+      await (await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product_DropDown > .ComboBoxItem_WebBlue')).click();
+      const btnSubmit = await this.page.$('#ctl00_PageContent_Button_TimeSeries');
+      await Promise.all([
+        this.waitN('domcontentloaded', 40000),
+        btnSubmit.click()
+      ]);
+      const priodeSelect = await this.page.waitForSelector('select#ctl00_PageContent_GridViewPanelControl_DropDownList_NumTimePeriod', { timeout: 60000 });
+      await Promise.all([
+        this.waitN(),
+        priodeSelect.select('20'),
+      ]);
+      const [product, countries] = await Promise.all([
+        this.page.$$eval(
+          '#ctl00_NavigationControl_DropDownList_Product > option',
+          (opts) => opts
+            .filter(opt => opt.value.length == 2)
+            .map(opt => opt.value),
+        ),
+        this.page.$$eval(
+          '#ctl00_NavigationControl_DropDownList_Country > option',
+          (opts) => opts
+            .map(opt => [opt.textContent, opt.value])
+        ),
+      ]);
+      this.product = product
+      this.countries = new Map(countries)
+    } catch (err) {
+      console.log(err)
+      await this.page.screenshot({ type: 'jpeg', path: `screenshots/_${new Date().toUTCString()}.jpeg` })
     }
-    let box = await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product')
-    await Promise.all([
-      this.waitN(),
-      box.click(),
-    ])
-    await this.sleep(2000)
-    box = await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product')
-    await box.click()
-    await (await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product_DropDown > .ComboBoxItem_WebBlue')).click();
-    const btnSubmit = await this.page.$('#ctl00_PageContent_Button_TimeSeries');
-    await Promise.all([
-      this.waitN('domcontentloaded', 40000),
-      btnSubmit.click()
-    ]);
-    const priodeSelect = await this.page.waitForSelector('select#ctl00_PageContent_GridViewPanelControl_DropDownList_NumTimePeriod', { timeout: 60000 });
-    await Promise.all([
-      this.waitN(),
-      priodeSelect.select('20'),
-    ]);
-    const [product, countries] = await Promise.all([
-      this.page.$$eval(
-        '#ctl00_NavigationControl_DropDownList_Product > option',
-        (opts) => opts
-          .filter(opt => opt.value.length == 2)
-          .map(opt => opt.value),
-      ),
-      this.page.$$eval(
-        '#ctl00_NavigationControl_DropDownList_Country > option',
-        (opts) => opts
-          .map(opt => [opt.textContent, opt.value])
-      ),
-    ]);
-    this.product = product
-    this.countries = new Map(countries)
   }
 
   sleep(timeout = 500) {
