@@ -69,6 +69,7 @@ async function parsing(eventType, filename) {
                 await unlink(dir + filename)
             } catch (_) { }
             console.log('done.')
+            await new Promise(r => setTimeout(r, 2000))
         }
     }
 }

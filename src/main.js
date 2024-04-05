@@ -93,8 +93,8 @@ class TradmapCrawler {
       this.product = product
       this.countries = new Map(countries)
     } catch (err) {
-      console.log(err)
       await this.page.screenshot({ type: 'jpeg', path: `screenshots/_${new Date().toUTCString()}.jpeg` })
+      throw err
     }
   }
 
