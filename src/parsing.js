@@ -53,10 +53,11 @@ async function parsing(eventType, filename) {
                 }
                 while (true) {
                     try {
-                        await Promise.all(
+                        console.log(await Promise.all(
                             dataToPush
                                 .map(result => uploadJson(result.path_data_raw.replace('s3://ai-pipeline-statistics/', ''), result))
-                        )
+                        ))
+
                         console.log(country_source, product_code, category, ++i, rows.length)
                         break
                     } catch (_) { }

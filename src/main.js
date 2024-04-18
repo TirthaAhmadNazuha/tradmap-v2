@@ -1,17 +1,14 @@
 import { launch } from 'puppeteer';
-import { createInterface } from 'readline/promises';
 import { readFile, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
+import strftime from 'strftime';
+import { uploadJson } from './lib/upload-s3.js';
 
-const rl = createInterface({
-  input: process.stdin,
-  output: process.stdout
-});
 class TradmapCrawler {
   constructor() {
     this.country = process.argv[2]
     if (!this.country) {
-      console.log('usage: node src/main.js <countryName or "world">')
+      console.log('usage: node src/main.js <countryName or "world" or stateFileName>')
       process.exit(1)
     }
     console.log(this.country)
@@ -19,7 +16,8 @@ class TradmapCrawler {
   }
   async start() {
     this.browser = await launch({
-      userDataDir: 'data_browser',
+      // headless: false,
+      // userDataDir: 'data_browser',
       args: [
         '--no-sandbox'
       ]
@@ -50,21 +48,13 @@ class TradmapCrawler {
 
   async init() {
     await this.open('https://www.trademap.org/Index.aspx')
+    await this.page.reload()
     try {
-      if (this.page.url().includes('Cookie')) {
-        await Promise.all([
-          this.page.click('#ctl00_MenuControl_CheckBox_DoNotShowAgain'),
-          this.waitN(),
-          this.page.click('#ctl00_MenuControl_div_Button_ClosePopupNews > input'),
-        ])
-      }
-      let box = await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product')
-      await Promise.all([
-        this.waitN(),
-        box.click(),
-      ])
-      await this.sleep(2000)
-      box = await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product')
+      await this.sleep(1000)
+      await this.page.evaluate(() => {
+        document.querySelector('#ctl00_PageContent_RadComboBox_Product_Input').value = ''
+      })
+      const box = await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product')
       await box.click()
       await (await this.page.waitForSelector('#ctl00_PageContent_RadComboBox_Product_DropDown > .ComboBoxItem_WebBlue')).click();
       const btnSubmit = await this.page.$('#ctl00_PageContent_Button_TimeSeries');
@@ -72,11 +62,17 @@ class TradmapCrawler {
         this.waitN('domcontentloaded', 40000),
         btnSubmit.click()
       ]);
+      await this.page.reload({ waitUntil: 'domcontentloaded' })
       const priodeSelect = await this.page.waitForSelector('select#ctl00_PageContent_GridViewPanelControl_DropDownList_NumTimePeriod', { timeout: 60000 });
+      const pageSelect = await this.page.$('#ctl00_PageContent_GridViewPanelControl_DropDownList_PageSize')
       await Promise.all([
         this.waitN(),
         priodeSelect.select('20'),
+        pageSelect.select('300'),
       ]);
+
+      console.log(await this.page.$eval('#ctl00_PageContent_GridViewPanelControl_DropDownList_PageSize option[selected]', (opt) => opt.getAttribute('value')))
+
       const [product, countries] = await Promise.all([
         this.page.$$eval(
           '#ctl00_NavigationControl_DropDownList_Product > option',
@@ -93,7 +89,6 @@ class TradmapCrawler {
       this.product = product
       this.countries = new Map(countries)
     } catch (err) {
-      await this.page.screenshot({ type: 'jpeg', path: `screenshots/_${new Date().toUTCString()}.jpeg` })
       throw err
     }
   }
@@ -106,8 +101,8 @@ class TradmapCrawler {
     let products = this.product
     let country_ = this.country
     try {
-      if (existsSync('state.txt')) {
-        const data_state = (await readFile('state.txt')).toString()
+      if (existsSync(`${this.country}_state.txt`)) {
+        const data_state = (await readFile(`${this.country}_state.txt`)).toString()
         if (data_state.includes(':')) {
           const [country, product_code] = data_state.split(':')
           country_ = country
@@ -145,24 +140,100 @@ class TradmapCrawler {
     }
     console.log('finding')
     for (const product of products) {
-      await Promise.all([
-        this.waitN(),
-        this.page.select('#ctl00_NavigationControl_DropDownList_Product', product),
-        this.page.select('#ctl00_NavigationControl_DropDownList_TradeType', 'E'),
-      ])
-      console.log('selected', product)
-      await (await this.page.waitForSelector('#ctl00_PageContent_GridViewPanelControl_ImageButton_ExportExcel')).click()
+      try {
+        await this.page.reload({ waitUntil: 'domcontentloaded' })
+        await Promise.all([
+          this.waitN(),
+          this.page.select('#ctl00_NavigationControl_DropDownList_Product', product),
+          this.page.select('#ctl00_NavigationControl_DropDownList_TradeType', 'E'),
+        ])
 
-      await Promise.all([
-        this.waitN(),
-        this.page.select('#ctl00_NavigationControl_DropDownList_TradeType', 'I'),
-      ])
+        console.log('selected', product)
+        await this.parsing()
 
-      await (await this.page.waitForSelector('#ctl00_PageContent_GridViewPanelControl_ImageButton_ExportExcel')).click()
-      await this.sleep(2000)
-      await writeFile('state.txt', `${country_}:${product}`)
+        console.log((await Promise.all([
+          this.waitN(),
+          this.page.select('#ctl00_NavigationControl_DropDownList_TradeType', 'I'),
+        ]))[0]?.status())
+
+        await this.parsing()
+        await writeFile(`${this.country}_state.txt`, `${country_}:${product}`)
+      } catch (error) {
+        console.log(error.message)
+        console.log(`cannot find ${product}`)
+      }
     }
     console.log('ends')
+  }
+
+  async parsing() {
+    await this.waitN()
+    while (true) {
+      try {
+        const { category, country_source, years, product_name, product_code, unit, rows } = await this.page.evaluate((country) => {
+          const rows = Array.from(document.querySelectorAll('#ctl00_PageContent_MyGridView1 tr'))
+            .map(tr =>
+              Array.from(tr.children)
+                .map(td => td.textContent.trim()).slice(1)
+            ).slice(2, -2)
+          const keys = rows.shift()
+          const category = document.querySelector('#ctl00_NavigationControl_DropDownList_TradeType option[selected]').textContent.trim()
+          const years = keys.map(str => str.split('value in ')[1]).filter(v => v);
+          const unit = document.querySelector('#ctl00_PageContent_Label_Unit').textContent.split(':')[1].trim()
+          let country_source = null
+          if (country == 'world') {
+            country_source = 'World'
+          } else {
+            country_source = document.querySelector('#ctl00_NavigationControl_DropDownList_Country option[selected]').getAttribute('title')
+          }
+          const product = document.querySelector('#ctl00_NavigationControl_DropDownList_Product option[selected]')
+          const [product_name, product_code] = [
+            product.getAttribute('title'),
+            product.getAttribute('value'),
+          ]
+          return {
+            category, country_source, years, product_name, product_code, unit, rows
+          }
+        }, this.country.toLowerCase())
+
+        const link = this.page.url()
+
+        for (const row of rows) {
+          console.clear()
+          for (const index in years) {
+            const year = years[index]
+            const result = {
+              'link': link,
+              'domain': 'trademap.org',
+              'tags': ['trademap.org', category, product_name],
+              'crawling_time': strftime('%Y-%m-%d %H:%M:%S'),
+              'crawling_time_epoch': Date.now(),
+              'path_data_raw': `s3://ai-pipeline-statistics/data/data_raw/trademap/yearly/${category}/${year}/${[country_source, row[0], product_name, unit].join('_').replaceAll(" ", "-")}.json`,
+              'path_data_clean': `s3://ai-pipeline-statistics/data/data_clean/trademap/yearly/${category}/${year}/${[country_source, row[0], product_name, unit].join('_').replaceAll(" ", "-")}.json`,
+              'country_source': country_source,
+              'country_target': row[0],
+              'product_name': product_name,
+              'product_code': product_code,
+              'year': year,
+              'category': category,
+              'value': row[Number(index) + 1],
+              'unit': unit
+            }
+            while (true) {
+              try {
+                await uploadJson(result.path_data_raw.replace('s3://ai-pipeline-statistics/', ''), result)
+                console.log(result.path_data_raw)
+                break
+              } catch (_) { }
+            }
+          }
+        }
+        break
+      } catch (error) {
+        console.log(error)
+        await this.page.reload({ waitUntil: 'domcontentloaded' })
+      }
+    }
   }
 
   async main() {
